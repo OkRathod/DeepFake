@@ -10,11 +10,16 @@ import numpy as np
 from tqdm import tqdm
 
 # ==========================================
-# CONFIGURATION
+# 1. UPDATED CONFIGURATION
 # ==========================================
-# ASVspoof 2019 logical access dataset paths (Update these!)
-REAL_AUDIO_DIR = r"Dataset\ASVspoof_LA\Real"
-FAKE_AUDIO_DIR = r"Dataset\ASVspoof_LA\Fake"
+# Point these directly to the extracted ASVspoof folders
+# Make sure to include the '/flac' subfolder if it exists!
+TRAIN_AUDIO_DIR = r"ASVspoof2019_root\LA\ASVspoof2019_LA_train\flac" 
+TRAIN_PROTOCOL_FILE = r"ASVspoof2019_root\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.train.trn.txt"
+
+DEV_AUDIO_DIR = r"ASVspoof2019_root\LA\ASVspoof2019_LA_dev\flac"
+DEV_PROTOCOL_FILE = r"ASVspoof2019_root\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
+
 MODEL_SAVE_PATH = "models/tinylstm_audio_v1.pth"
 
 BATCH_SIZE = 64
@@ -22,40 +27,49 @@ EPOCHS = 30
 LEARNING_RATE = 0.001
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Audio parameters
 SAMPLE_RATE = 16000
-MAX_AUDIO_LENGTH = 3.0  # Seconds (Truncate/Pad to this length to standardize LSTM sequence)
-FAKE_PENALTY_WEIGHT = 4.0 # (Step D)
+MAX_AUDIO_LENGTH = 3.0  # Seconds
+FAKE_PENALTY_WEIGHT = 4.0 # Punish the model 4x harder for missing a deepfake
 
 # ==========================================
-# STEP A & B: VAD AND LFCC EXTRACTION
+# 2. UPDATED DATASET PARSER (Protocol Based)
 # ==========================================
 class AudioForensicDataset(Dataset):
-    def __init__(self, real_dir, fake_dir, max_duration=3.0, sample_rate=16000):
+    def __init__(self, audio_dir, protocol_file, max_duration=3.0, sample_rate=16000):
         self.file_paths = []
         self.labels = []
         self.max_length = int(sample_rate * max_duration)
         self.sample_rate = sample_rate
+        self.audio_dir = audio_dir
 
-        # Load file paths
-        if os.path.exists(real_dir):
-            for f in os.listdir(real_dir):
-                if f.endswith('.wav') or f.endswith('.flac'):
-                    self.file_paths.append(os.path.join(real_dir, f))
-                    self.labels.append(1.0) # Real = 1
-                    
-        if os.path.exists(fake_dir):
-            for f in os.listdir(fake_dir):
-                if f.endswith('.wav') or f.endswith('.flac'):
-                    self.file_paths.append(os.path.join(fake_dir, f))
-                    self.labels.append(0.0) # Fake = 0
+        print(f"[INFO] Parsing Protocol File: {protocol_file}")
+        
+        # 1. Read the text file mapping
+        with open(protocol_file, 'r') as f:
+            lines = f.readlines()
+            
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                # Column 2 is the filename (e.g., LA_T_1138215)
+                filename = parts[1] + ".flac"
+                file_path = os.path.join(self.audio_dir, filename)
+                
+                # Column 5 is the label (bonafide or spoof)
+                label_str = parts[4]
+                label = 1.0 if label_str == "bonafide" else 0.0 # Real = 1, Fake = 0
+                
+                # Only add if the audio file actually exists on the hard drive
+                if os.path.exists(file_path):
+                    self.file_paths.append(file_path)
+                    self.labels.append(label)
 
-        # STEP B: The LFCC Extractor (Linear Frequency Cepstral Coefficients)
-        # Why LFCC? It doesn't compress high frequencies like MFCC does. 
-        # AI generators struggle with high-frequency phase alignment.
+        print(f"[INFO] Successfully loaded {len(self.file_paths)} audio paths.")
+
+        # 2. The LFCC Extractor (Linear Frequency Cepstral Coefficients)
         self.lfcc_transform = T.LFCC(
             sample_rate=self.sample_rate,
-            n_lfcc=40, # Extract 40 frequency bands
+            n_lfcc=40, 
             speckwargs={"n_fft": 512, "hop_length": 256, "center": False}
         )
 
@@ -66,32 +80,28 @@ class AudioForensicDataset(Dataset):
         path = self.file_paths[idx]
         label = self.labels[idx]
 
-        # Load audio using librosa (easier to trim silence)
+        # Load audio (Librosa automatically resamples to 16k if needed)
         waveform, sr = librosa.load(path, sr=self.sample_rate)
 
-        # STEP A: VAD (Voice Activity Detection) - Trimming dead silence
-        # This prevents the LSTM from wasting compute on room noise
+        # VAD (Voice Activity Detection) - Trimming dead silence
         waveform, _ = librosa.effects.trim(waveform, top_db=30)
 
-        # Convert back to tensor
-        waveform = torch.tensor(waveform).unsqueeze(0) # Shape: [1, Time]
+        # Convert back to PyTorch tensor
+        waveform = torch.tensor(waveform).unsqueeze(0) 
 
-        # Standardize Length (Pad if too short, Truncate if too long)
+        # Standardize Length
         if waveform.shape[1] > self.max_length:
             waveform = waveform[:, :self.max_length]
         else:
             pad_amount = self.max_length - waveform.shape[1]
             waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
 
-        # Apply LFCC Extraction
-        lfcc = self.lfcc_transform(waveform) # Shape: [1, n_lfcc, Time/hop_length]
-        
-        # LSTM expects input shape: [Sequence_Length, Batch, Features] or [Batch, Seq, Features]
-        # We drop the channel dimension and transpose to [Time, Features]
+        # Extract LFCC and reshape for LSTM
+        lfcc = self.lfcc_transform(waveform) 
         lfcc = lfcc.squeeze(0).transpose(0, 1) 
 
         return lfcc, torch.tensor(label, dtype=torch.float32)
-
+    
 # ==========================================
 # STEP C: THE TINY-LSTM ARCHITECTURE
 # ==========================================
@@ -143,32 +153,30 @@ def train():
     print(f"[INFO] Using Device: {DEVICE}")
     print("[INFO] Preparing Audio Dataset (VAD + LFCC Extraction)...")
     
-    # 1. Load Data
-    dataset = AudioForensicDataset(REAL_AUDIO_DIR, FAKE_AUDIO_DIR, max_duration=MAX_AUDIO_LENGTH)
+    # 1. Load Train and Validation Data Separately using the Protocol Files
+    print("\n--- Loading Training Set ---")
+    train_dataset = AudioForensicDataset(TRAIN_AUDIO_DIR, TRAIN_PROTOCOL_FILE, max_duration=MAX_AUDIO_LENGTH)
     
-    if len(dataset) == 0:
-        print("[ERROR] No audio files found. Check your dataset paths.")
+    print("\n--- Loading Validation Set ---")
+    val_dataset = AudioForensicDataset(DEV_AUDIO_DIR, DEV_PROTOCOL_FILE, max_duration=MAX_AUDIO_LENGTH)
+    
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        print("[ERROR] Audio files not found. Please double-check your folder paths.")
         return
 
-    # Train/Val Split (80/20)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
+    # 2. Create DataLoaders
+    # We don't need random_split anymore because ASVspoof provides a dedicated Dev set
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-    # 2. Init Model
+    # 3. Init Model
     model = TinyLSTM(input_size=40, hidden_size=64).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
     
     # STEP D: THE ANTI-LAZY PENALTY
-    # Since Fake = 0 and Real = 1, we must dynamically weight the loss for Fake samples.
-    # We punish the model heavily if it predicts "Real" when the audio is actually a Voice Clone.
-    
     best_val_loss = float('inf')
     
-    print("[INFO] Beginning LSTM Training...")
+    print("\n[INFO] Beginning LSTM Training...")
     for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
@@ -225,6 +233,6 @@ def train():
             os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print("🌟 Best Audio Sentinel Model Saved!")
-
+            
 if __name__ == '__main__':
     train()
