@@ -21,7 +21,7 @@ To run the training script and audio extraction pipeline, ensure you have the fo
 
 **Run the following command:**
 ```bash
-pip install torch torchaudio librosa tqdm numpy
+pip install torch torchaudio librosa tqdm numpy matplotlib seaborn scikit-learn
 ```
 
 * **`torch` & `torchaudio`:** For the core neural network architecture and high-performance tensor transformations.
